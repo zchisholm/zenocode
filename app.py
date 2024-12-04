@@ -8,6 +8,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from openai import OpenAI
 from pinecone import Pinecone
 from git import Repo
+import json
 from langchain.schema import Document
 
 # Helper Functions
@@ -48,10 +49,30 @@ def get_huggingface_embeddings(text, model_name="sentence-transformers/all-mpnet
     return model.encode(text)
 
 
+def load_cached_embeddings(repo_path):
+    cache_file = os.path.join(repo_path, "embeddings_cache.json")
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            return json.load(f)
+    return None
+
+
+def save_embeddings_to_cache(repo_path, documents):
+    cache_file = os.path.join(repo_path, "embeddings_cache.json")
+    with open(cache_file, "w") as f:
+        json.dump(documents, f)
+
+
+@st.cache_resource
+def initialize_pinecone():
+    pinecone_api_key = st.secrets["PINECONE_API_KEY"]
+    os.environ["PINECONE_API_KEY"] = pinecone_api_key
+    return Pinecone(api_key=pinecone_api_key).Index(pinecone_index_name)
+
 def perform_rag(query):
     query_embedding = get_huggingface_embeddings(query)
     results = pinecone_index.query(
-        vector=query_embedding.tolist(), top_k=5, include_metadata=True, namespace=repo_link
+        vector=query_embedding.tolist(), top_k=3, include_metadata=True, namespace=repo_link
     )
     contexts = [item["metadata"]["text"]
                 for item in results.get("matches", [])]
@@ -59,14 +80,25 @@ def perform_rag(query):
         "<CONTEXT>\n" + "\n\n---------\n\n".join(
             contexts[:10]) + "\n--------\n</CONTEXT>\n\nMY QUESTION:\n" + query
     )
-    response = client.chat.completions.create(
-        model="llama-3.1-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": augmented_query},
-        ],
-    )
-    return response.choices[0].message.content
+
+    model = "llama-3.1-70b-versatile"
+
+    with st.spinner("Generating a response..."):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": augmented_query}
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            st.error(
+                "All models failed to generate a response. Please try again later.")
+
+
+    return "Unable to generate a response at this time."
 
 
 # Constants
@@ -79,7 +111,8 @@ Answer any questions about the codebase, using the provided context.
 """
 
 # Streamlit Setup
-st.title("Codebase QA - RAG over Codebase")
+st.title("Welcome to Zeno Code")
+st.subheader("RAG over codebase")
 
 # Clone Repository
 repo_link = st.text_input("Enter GitHub Repo URL",
@@ -94,10 +127,8 @@ files = get_main_files_content(repo_path)
 st.info(f"Loaded {len(files)} code files for analysis.")
 
 # Pinecone Setup
-pinecone_api_key = st.secrets["PINECONE_API_KEY"]
-os.environ["PINECONE_API_KEY"] = pinecone_api_key
 pinecone_index_name = "zeno-code"
-pinecone_index = Pinecone(api_key=pinecone_api_key).Index(pinecone_index_name)
+pinecone_index = initialize_pinecone()
 
 # Insert Embeddings into Pinecone
 documents = [Document(page_content=f"{file['name']}\n{file['content']}", metadata={
